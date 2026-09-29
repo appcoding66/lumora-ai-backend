@@ -9,123 +9,101 @@ app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 3000;
 
-const CHAT_MODEL =
-  process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
+// ================================
+// GEMINI SETTINGS
+// ================================
 
-const IMAGE_MODEL =
-  process.env.GEMINI_IMAGE_MODEL || "gemini-3.1-flash-image";
+const CHAT_MODEL = "gemini-3.5-flash-lite";
+const IMAGE_MODEL = "gemini-3.1-flash-image";
+
+const GEMINI_API_URL =
+  "https://generativelanguage.googleapis.com/v1beta/interactions";
 
 
-// ===============================
+// ================================
 // HOME
-// ===============================
+// ================================
 
 app.get("/", (req, res) => {
   res.json({
     name: "Lumora AI Backend",
     status: "online",
     provider: "Google Gemini",
-    model: CHAT_MODEL,
+    chatModel: CHAT_MODEL,
     imageModel: IMAGE_MODEL
   });
 });
 
 
-// ===============================
-// EXTRACT GEMINI TEXT
-// ===============================
-
-function extractText(data) {
-  const parts =
-    data?.candidates?.[0]?.content?.parts;
-
-  if (!Array.isArray(parts)) {
-    return "";
-  }
-
-  return parts
-    .filter(part => typeof part?.text === "string")
-    .map(part => part.text)
-    .join("")
-    .trim();
-}
-
-
-// ===============================
-// CREATOR QUESTION DETECTION
-// ===============================
+// ================================
+// CREATOR QUESTION
+// ================================
 
 function isCreatorQuestion(message) {
-  return /(?:who\s+(?:created|made|built|developed)\s+you|who\s+is\s+your\s+(?:creator|developer|maker)|কে\s*(?:তোমাকে|আপনাকে|আপনি)?\s*(?:তৈরি|বান|ডেভেলপ)\s*(?:করেছে|করেছেন|করল|করলেন)|তোমাকে\s*কে\s*বানিয়েছে|আপনাকে\s*কে\s*বানিয়েছে|কে\s*তোমাকে\s*তৈরি\s*করেছে|কে\s*আপনাকে\s*তৈরি\s*করেছে)/i.test(
-    message
+
+  const text = message.toLowerCase();
+
+  return (
+    text.includes("who created you") ||
+    text.includes("who made you") ||
+    text.includes("who built you") ||
+    text.includes("who developed you") ||
+    text.includes("who is your creator") ||
+    text.includes("who is your developer") ||
+    text.includes("কে তোমাকে তৈরি করেছে") ||
+    text.includes("কে আপনাকে তৈরি করেছে") ||
+    text.includes("তোমাকে কে বানিয়েছে") ||
+    text.includes("আপনাকে কে বানিয়েছে") ||
+    text.includes("কে তোমাকে বানিয়েছে") ||
+    text.includes("কে আপনাকে বানিয়েছে")
   );
 }
 
 
-// ===============================
-// GEMINI CHAT
-// ===============================
+// ================================
+// CHAT WITH GEMINI
+// ================================
 
-async function chatWithGemini(message) {
+async function askGemini(message) {
 
-  const url =
-    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-      CHAT_MODEL
-    )}:generateContent`;
+  const requestBody = {
 
-  const body = {
+    model: CHAT_MODEL,
 
-    systemInstruction: {
-      parts: [
-        {
-          text:
-            "You are Lumora AI, a helpful general-purpose AI assistant. " +
-            "Lumora AI was created and developed by Ankush Mondal (অঙ্কুশ মণ্ডল). " +
-            "Do not claim that Ankush Mondal created the underlying Google Gemini model. " +
-            "Lumora AI is the app/assistant created by Ankush Mondal, while the underlying AI technology is provided by Google Gemini. " +
-            "Use the same language as the user. " +
-            "For Bengali questions, answer naturally in Bengali. " +
-            "Do not invent facts."
-        }
-      ]
+    input: message,
+
+    system_instruction:
+      "You are Lumora AI, a helpful AI assistant. " +
+      "Lumora AI was created and developed by Ankush Mondal (অঙ্কুশ মণ্ডল). " +
+      "Ankush Mondal created the Lumora AI app and assistant, " +
+      "but he did not create Google Gemini itself. " +
+      "The underlying AI technology is provided by Google Gemini. " +
+      "Always answer in the same language used by the user. " +
+      "If the user speaks Bengali, answer naturally in Bengali. " +
+      "Be helpful, accurate and clear. " +
+      "Do not invent information.",
+
+    generation_config: {
+      max_output_tokens: 4096
     },
 
-    contents: [
-      {
-        role: "user",
-        parts: [
-          {
-            text: message
-          }
-        ]
-      }
-    ],
-
-    generationConfig: {
-      temperature: 0.7,
-      maxOutputTokens: 4096
-    },
-
-    tools: [
-      {
-        google_search: {}
-      }
-    ]
+    store: false
   };
 
 
-  const response = await fetch(url, {
+  const response = await fetch(
+    GEMINI_API_URL,
+    {
+      method: "POST",
 
-    method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": process.env.GEMINI_API_KEY
+      },
 
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": process.env.GEMINI_API_KEY
-    },
-
-    body: JSON.stringify(body)
-
-  });
+      body: JSON.stringify(requestBody)
+    }
+  );
 
 
   const data = await response.json();
@@ -135,7 +113,7 @@ async function chatWithGemini(message) {
 
     const error = new Error(
       data?.error?.message ||
-      `Gemini error ${response.status}`
+      `Gemini API error: ${response.status}`
     );
 
     error.status = response.status;
@@ -144,13 +122,28 @@ async function chatWithGemini(message) {
   }
 
 
-  return extractText(data);
+  const answer =
+    data?.output_text;
+
+
+  if (
+    typeof answer !== "string" ||
+    !answer.trim()
+  ) {
+
+    throw new Error(
+      "Gemini returned an empty response."
+    );
+  }
+
+
+  return answer.trim();
 }
 
 
-// ===============================
+// ================================
 // CHAT API
-// ===============================
+// ================================
 
 app.post("/chat", async (req, res) => {
 
@@ -167,29 +160,25 @@ app.post("/chat", async (req, res) => {
   }
 
 
-  // Creator question is answered directly
-  // without asking Gemini.
+  if (!process.env.GEMINI_API_KEY) {
 
-  if (isCreatorQuestion(message)) {
-
-    return res.json({
-
-      reply:
-        "আমি Lumora AI। আমাকে তৈরি ও ডেভেলপ করেছেন অঙ্কুশ মণ্ডল (Ankush Mondal)। আমার AI প্রযুক্তি Google Gemini দ্বারা চালিত।"
-
+    return res.status(500).json({
+      error:
+        "GEMINI_API_KEY is not configured on the server."
     });
 
   }
 
 
-  // Check API key
+  // Creator question
+  if (isCreatorQuestion(message)) {
 
-  if (!process.env.GEMINI_API_KEY) {
+    return res.json({
 
-    return res.status(500).json({
+      reply:
+        "আমি Lumora AI। আমাকে তৈরি ও ডেভেলপ করেছেন অঙ্কুশ মণ্ডল (Ankush Mondal)। আমার AI প্রযুক্তি Google Gemini দ্বারা চালিত।",
 
-      error:
-        "GEMINI_API_KEY is not configured on the server."
+      model: CHAT_MODEL
 
     });
 
@@ -199,19 +188,7 @@ app.post("/chat", async (req, res) => {
   try {
 
     const reply =
-      await chatWithGemini(message);
-
-
-    if (!reply) {
-
-      return res.status(502).json({
-
-        error:
-          "Gemini returned no text response."
-
-      });
-
-    }
+      await askGemini(message);
 
 
     return res.json({
@@ -224,10 +201,11 @@ app.post("/chat", async (req, res) => {
 
   }
 
+
   catch (error) {
 
     console.error(
-      "Lumora Gemini error:",
+      "Lumora AI error:",
       error
     );
 
@@ -247,167 +225,169 @@ app.post("/chat", async (req, res) => {
 });
 
 
-// ===============================
+// ================================
 // IMAGE GENERATION
-// ===============================
+// ================================
 
-app.post("/generate-image", async (req, res) => {
+app.post(
+  "/generate-image",
+  async (req, res) => {
 
-  const prompt =
-    String(req.body?.prompt || "").trim();
-
-
-  if (!prompt) {
-
-    return res.status(400).json({
-
-      error:
-        "Image prompt is required."
-
-    });
-
-  }
+    const prompt =
+      String(req.body?.prompt || "").trim();
 
 
-  if (!process.env.GEMINI_API_KEY) {
+    if (!prompt) {
 
-    return res.status(500).json({
+      return res.status(400).json({
+        error: "Image prompt is required."
+      });
 
-      error:
-        "GEMINI_API_KEY is not configured on the server."
-
-    });
-
-  }
-
-
-  try {
-
-    const url =
-      "https://generativelanguage.googleapis.com/v1beta/interactions";
-
-
-    const body = {
-
-      model: IMAGE_MODEL,
-
-      input: [
-        {
-          type: "text",
-          text: prompt
-        }
-      ],
-
-      response_format: {
-        type: "image",
-        mime_type: "image/png",
-        aspect_ratio: "1:1",
-        image_size: "1K"
-      }
-
-    };
-
-
-    const response = await fetch(url, {
-
-      method: "POST",
-
-      headers: {
-
-        "Content-Type": "application/json",
-
-        "x-goog-api-key":
-          process.env.GEMINI_API_KEY
-
-      },
-
-      body: JSON.stringify(body)
-
-    });
-
-
-    const data =
-      await response.json();
-
-
-    if (!response.ok) {
-
-      const error = new Error(
-        data?.error?.message ||
-        `Image API error ${response.status}`
-      );
-
-      error.status =
-        response.status;
-
-      throw error;
     }
 
 
-    const image =
-      data?.output_image;
+    if (!process.env.GEMINI_API_KEY) {
 
-
-    if (!image?.data) {
-
-      return res.status(502).json({
-
+      return res.status(500).json({
         error:
+          "GEMINI_API_KEY is not configured on the server."
+      });
+
+    }
+
+
+    try {
+
+      const requestBody = {
+
+        model: IMAGE_MODEL,
+
+        input: prompt,
+
+        response_format: {
+
+          type: "image",
+
+          mime_type: "image/png",
+
+          aspect_ratio: "1:1",
+
+          image_size: "1K"
+
+        },
+
+        store: false
+
+      };
+
+
+      const response =
+        await fetch(
+          GEMINI_API_URL,
+          {
+            method: "POST",
+
+            headers: {
+
+              "Content-Type":
+                "application/json",
+
+              "x-goog-api-key":
+                process.env.GEMINI_API_KEY
+
+            },
+
+            body:
+              JSON.stringify(requestBody)
+
+          }
+        );
+
+
+      const data =
+        await response.json();
+
+
+      if (!response.ok) {
+
+        const error = new Error(
+          data?.error?.message ||
+          `Image API error: ${response.status}`
+        );
+
+        error.status =
+          response.status;
+
+        throw error;
+
+      }
+
+
+      const image =
+        data?.output_image;
+
+
+      if (!image?.data) {
+
+        throw new Error(
           "The image model returned no image."
+        );
+
+      }
+
+
+      const mime =
+        image.mime_type ||
+        "image/png";
+
+
+      return res.json({
+
+        image:
+          `data:${mime};base64,${image.data}`,
+
+        model: IMAGE_MODEL
 
       });
 
     }
 
 
-    const mime =
-      image.mime_type ||
-      "image/png";
+    catch (error) {
+
+      console.error(
+        "Image generation error:",
+        error
+      );
 
 
-    return res.json({
+      return res.status(
+        error.status || 500
+      ).json({
 
-      image:
-        `data:${mime};base64,${image.data}`,
+        error:
+          error.message ||
+          "Unable to generate image."
 
-      model:
-        IMAGE_MODEL
+      });
 
-    });
+    }
 
   }
+);
 
-  catch (error) {
 
-    console.error(
-      "Image generation error:",
-      error
+// ================================
+// START SERVER
+// ================================
+
+app.listen(
+  PORT,
+  () => {
+
+    console.log(
+      `Lumora AI Backend running on port ${PORT}`
     );
 
-
-    return res.status(
-      error.status || 500
-    ).json({
-
-      error:
-        error.message ||
-        "Unable to generate image."
-
-    });
-
   }
-
-});
-
-
-// ===============================
-// START SERVER
-// ===============================
-
-app.listen(PORT, () => {
-
-  console.log(
-    `Lumora AI backend running on port ${PORT}`
-  );
-
-});
+);
