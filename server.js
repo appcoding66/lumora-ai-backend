@@ -11,8 +11,7 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-// Gemini model fallback
-// একটি model ব্যস্ত থাকলে পরের model চেষ্টা করবে।
+// Gemini fallback models
 const MODELS = [
   "gemini-3.5-flash-lite",
   "gemini-3.8-flash",
@@ -20,26 +19,56 @@ const MODELS = [
   "gemini-3.6-flash"
 ];
 
-const CREATOR_REPLY =
-  "আমি Lumora AI। আমাকে তৈরি ও ডেভেলপ করেছেন অঙ্কুশ মণ্ডল (Ankush Mondal)। আমার AI প্রযুক্তি Google Gemini দ্বারা চালিত।";
+// Only used when the user asks who created Lumora AI.
+const CREATOR_REPLY_BN =
+  "আমি Lumora AI। আমাকে তৈরি ও ডেভেলপ করেছেন অঙ্কুশ মণ্ডল (Ankush Mondal)।";
+
+const CREATOR_REPLY_EN =
+  "I am Lumora AI. I was created and developed by Ankush Mondal.";
 
 function isCreatorQuestion(message) {
-  const text = message.toLowerCase();
+  const text = message.toLowerCase().trim();
 
-  return (
-    text.includes("who created you") ||
-    text.includes("who made you") ||
-    text.includes("who built you") ||
-    text.includes("who developed you") ||
-    text.includes("who is your creator") ||
-    text.includes("who is your developer") ||
-    text.includes("কে তোমাকে তৈরি করেছে") ||
-    text.includes("কে আপনাকে তৈরি করেছে") ||
-    text.includes("তোমাকে কে বানিয়েছে") ||
-    text.includes("আপনাকে কে বানিয়েছে") ||
-    text.includes("কে তোমাকে বানিয়েছে") ||
-    text.includes("কে আপনাকে বানিয়েছে")
+  const creatorQuestions = [
+    "who created you",
+    "who made you",
+    "who built you",
+    "who developed you",
+    "who is your creator",
+    "who is your developer",
+    "who created lumora ai",
+    "who made lumora ai",
+
+    "কে তোমাকে তৈরি করেছে",
+    "কে আপনাকে তৈরি করেছে",
+    "তোমাকে কে বানিয়েছে",
+    "আপনাকে কে বানিয়েছে",
+    "কে তোমাকে বানিয়েছে",
+    "কে আপনাকে বানিয়েছে",
+    "লুমোরা এআই কে তৈরি করেছে",
+    "লুমোরা এআই কে বানিয়েছে",
+    "লুমোরা এআই কে বানিয়েছে"
+  ];
+
+  return creatorQuestions.some(question =>
+    text.includes(question)
   );
+}
+
+function isEnglish(message) {
+  const text = message.trim();
+
+  if (!text) return false;
+
+  // Bengali Unicode range
+  const bengaliCharacters =
+    (text.match(/[\u0980-\u09FF]/g) || []).length;
+
+  // Basic Latin letters
+  const englishCharacters =
+    (text.match(/[A-Za-z]/g) || []).length;
+
+  return englishCharacters >= bengaliCharacters;
 }
 
 function shouldFallback(error) {
@@ -64,19 +93,37 @@ function shouldFallback(error) {
 }
 
 async function generateWithModel(ai, model, message) {
+  const languageInstruction = isEnglish(message)
+    ? "Reply in English."
+    : "Reply in Bengali.";
+
   const response = await ai.models.generateContent({
     model: model,
     contents: message,
 
     config: {
       systemInstruction:
-        "You are Lumora AI, a helpful AI assistant. " +
-        "Lumora AI was created and developed by Ankush Mondal (অঙ্কুশ মণ্ডল). " +
-        "Ankush Mondal created the Lumora AI app and assistant, " +
-        "but he did not create Google Gemini itself. " +
-        "Always answer in the same language used by the user. " +
-        "If the user speaks Bengali, answer naturally in Bengali. " +
-        "Be helpful, accurate and clear. " +
+        "You are Lumora AI, a helpful general-purpose AI assistant. " +
+
+        "Answer the user's actual request directly. " +
+
+        languageInstruction + " " +
+
+        "Never mention Ankush Mondal, your creator, developer, " +
+        "Lumora's creator, Google Gemini, or your underlying AI technology " +
+        "unless the user specifically asks who created, made, built, " +
+        "or developed you. " +
+
+        "Do not repeat creator information in normal conversations. " +
+
+        "Do not introduce yourself unnecessarily. " +
+
+        "If the user asks you to perform a task, help with that task directly. " +
+
+        "Do not add unrelated information about your creator. " +
+
+        "Be helpful, accurate, natural and concise. " +
+
         "Do not invent information.",
 
       maxOutputTokens: 4096
@@ -136,7 +183,6 @@ async function askGemini(message) {
         throw error;
       }
 
-      // পরের model চেষ্টা করার আগে ছোট delay
       await new Promise(resolve =>
         setTimeout(resolve, 500)
       );
@@ -152,24 +198,23 @@ async function askGemini(message) {
 }
 
 
-// ===============================
-// HOME / STATUS
-// ===============================
+// ======================================
+// HOME
+// ======================================
 
 app.get("/", (req, res) => {
   res.json({
     name: "Lumora AI Backend",
     status: "online",
     provider: "Google Gemini",
-    fallback: true,
-    models: MODELS
+    fallback: true
   });
 });
 
 
-// ===============================
+// ======================================
 // HEALTH CHECK
-// ===============================
+// ======================================
 
 app.get("/health", (req, res) => {
   res.json({
@@ -179,9 +224,9 @@ app.get("/health", (req, res) => {
 });
 
 
-// ===============================
-// CHAT API
-// ===============================
+// ======================================
+// CHAT
+// ======================================
 
 app.post("/chat", async (req, res) => {
   try {
@@ -202,13 +247,24 @@ app.post("/chat", async (req, res) => {
       });
     }
 
-    // Creator question হলে সরাসরি Lumora-এর উত্তর
+    // ==================================
+    // CREATOR QUESTION
+    // ==================================
+
     if (isCreatorQuestion(message)) {
+      const reply = isEnglish(message)
+        ? CREATOR_REPLY_EN
+        : CREATOR_REPLY_BN;
+
       return res.json({
-        reply: CREATOR_REPLY,
+        reply: reply,
         model: "lumora-creator-response"
       });
     }
+
+    // ==================================
+    // NORMAL AI CHAT
+    // ==================================
 
     const result = await askGemini(message);
 
@@ -231,9 +287,9 @@ app.post("/chat", async (req, res) => {
 });
 
 
-// ===============================
+// ======================================
 // START SERVER
-// ===============================
+// ======================================
 
 app.listen(PORT, () => {
   console.log(
