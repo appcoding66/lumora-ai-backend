@@ -9,27 +9,27 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "20mb" }));
 
-// Gemini fallback models
-const MODELS = [
-  "gemini-3.5-flash-lite",
+const CHAT_MODELS = [
   "gemini-3.8-flash",
   "gemini-3.7-flash",
-  "gemini-3.6-flash"
+  "gemini-3.6-flash",
+  "gemini-3.5-flash-lite"
 ];
 
-// Only used when the user asks who created Lumora AI.
-const CREATOR_REPLY_BN =
+const IMAGE_MODEL = "gemini-3.1-flash-image";
+
+const CREATOR_BN =
   "আমি Lumora AI। আমাকে তৈরি ও ডেভেলপ করেছেন অঙ্কুশ মণ্ডল (Ankush Mondal)।";
 
-const CREATOR_REPLY_EN =
+const CREATOR_EN =
   "I am Lumora AI. I was created and developed by Ankush Mondal.";
 
-function isCreatorQuestion(message) {
+function isCreatorQuestion(message = "") {
   const text = message.toLowerCase().trim();
 
-  const creatorQuestions = [
+  const patterns = [
     "who created you",
     "who made you",
     "who built you",
@@ -38,7 +38,6 @@ function isCreatorQuestion(message) {
     "who is your developer",
     "who created lumora ai",
     "who made lumora ai",
-
     "কে তোমাকে তৈরি করেছে",
     "কে আপনাকে তৈরি করেছে",
     "তোমাকে কে বানিয়েছে",
@@ -50,29 +49,17 @@ function isCreatorQuestion(message) {
     "লুমোরা এআই কে বানিয়েছে"
   ];
 
-  return creatorQuestions.some(question =>
-    text.includes(question)
-  );
+  return patterns.some((p) => text.includes(p));
 }
 
-function isEnglish(message) {
-  const text = message.trim();
-
-  if (!text) return false;
-
-  // Bengali Unicode range
-  const bengaliCharacters =
-    (text.match(/[\u0980-\u09FF]/g) || []).length;
-
-  // Basic Latin letters
-  const englishCharacters =
-    (text.match(/[A-Za-z]/g) || []).length;
-
-  return englishCharacters >= bengaliCharacters;
+function isMostlyEnglish(text = "") {
+  const bn = (text.match(/[\u0980-\u09FF]/g) || []).length;
+  const en = (text.match(/[A-Za-z]/g) || []).length;
+  return en >= bn;
 }
 
 function shouldFallback(error) {
-  const text = [
+  const raw = [
     error?.message,
     error?.status,
     error?.code,
@@ -83,65 +70,142 @@ function shouldFallback(error) {
     .toUpperCase();
 
   return (
-    /\b(429|500|502|503|504)\b/.test(text) ||
-    text.includes("UNAVAILABLE") ||
-    text.includes("RESOURCE_EXHAUSTED") ||
-    text.includes("HIGH DEMAND") ||
-    text.includes("OVERLOADED") ||
-    text.includes("RATE LIMIT")
+    /\b(429|500|502|503|504)\b/.test(raw) ||
+    raw.includes("UNAVAILABLE") ||
+    raw.includes("RESOURCE_EXHAUSTED") ||
+    raw.includes("HIGH DEMAND") ||
+    raw.includes("OVERLOADED") ||
+    raw.includes("RATE LIMIT")
   );
 }
 
-async function generateWithModel(ai, model, message) {
-  const languageInstruction = isEnglish(message)
-    ? "Reply in English."
-    : "Reply in Bengali.";
+function parseDataUrl(dataUrl) {
+  if (typeof dataUrl !== "string") return null;
+
+  const match = dataUrl.match(
+    /^data:(image\/[a-zA-Z0-9.+-]+);base64,([\s\S]+)$/
+  );
+
+  if (!match) return null;
+
+  return {
+    mimeType: match[1],
+    data: match[2]
+  };
+}
+
+function cleanHistory(history) {
+  if (!Array.isArray(history)) return [];
+
+  return history
+    .slice(-12)
+    .filter(
+      (item) =>
+        item &&
+        (item.role === "user" || item.role === "model")
+    )
+    .map((item) => ({
+      role: item.role,
+      parts: [
+        {
+          text: String(item.content || "").slice(0, 12000)
+        }
+      ]
+    }));
+}
+
+const SYSTEM_INSTRUCTION = `
+You are Lumora AI, a capable general-purpose AI assistant.
+
+Your job is to understand the user's actual goal and help complete the task, not merely talk about the task.
+
+TASK EXECUTION:
+- Analyze what the user is asking for before answering.
+- If the user asks for code, produce complete usable code when enough information is available.
+- If the user asks to fix, improve, or rewrite code, work directly on the provided code.
+- If the user asks for a website, app, document, message, plan, explanation, calculation, or other deliverable, provide the actual useful result.
+- If the user asks for an explanation, explain clearly and directly.
+- If the user provides an image or screenshot, inspect it and use what is visible in the image.
+- If the user asks for current, recent, live, official, or location-specific information, use web search when available.
+- If the user asks for a website link, provide a useful official or directly relevant link when available.
+- For current political or public-office questions, provide factual current information from reliable sources and avoid political persuasion or rankings.
+- Do not claim that you performed an external action unless you actually did it.
+- Do not invent facts, links, results, or completed actions.
+
+LANGUAGE:
+- Reply in the same language as the user's latest message.
+- English input -> English response.
+- Bengali input -> Bengali response.
+- Hindi input -> Hindi response.
+- If the user mixes languages, use the dominant language.
+
+CREATOR:
+- Never mention Ankush Mondal or your creator in ordinary conversation.
+- Only discuss your creator when the user explicitly asks who created, made, built, or developed you.
+- Do not mention Google Gemini or your underlying AI provider in the creator answer.
+
+STYLE:
+- Be natural and helpful.
+- Do not repeatedly introduce yourself.
+- When the user gives a concrete task, focus on completing it.
+`;
+
+async function generateChat(ai, model, message, history, image) {
+  const contents = [];
+
+  const previous = cleanHistory(history);
+  contents.push(...previous);
+
+  const currentParts = [];
+
+  const imagePart = parseDataUrl(image);
+
+  if (imagePart) {
+    currentParts.push({
+      inlineData: {
+        mimeType: imagePart.mimeType,
+        data: imagePart.data
+      }
+    });
+  }
+
+  currentParts.push({
+    text: String(
+      message || "Please analyze the attached image."
+    )
+  });
+
+  contents.push({
+    role: "user",
+    parts: currentParts
+  });
 
   const response = await ai.models.generateContent({
-    model: model,
-    contents: message,
-
+    model,
+    contents,
     config: {
-      systemInstruction:
-        "You are Lumora AI, a helpful general-purpose AI assistant. " +
-
-        "Answer the user's actual request directly. " +
-
-        languageInstruction + " " +
-
-        "Never mention Ankush Mondal, your creator, developer, " +
-        "Lumora's creator, Google Gemini, or your underlying AI technology " +
-        "unless the user specifically asks who created, made, built, " +
-        "or developed you. " +
-
-        "Do not repeat creator information in normal conversations. " +
-
-        "Do not introduce yourself unnecessarily. " +
-
-        "If the user asks you to perform a task, help with that task directly. " +
-
-        "Do not add unrelated information about your creator. " +
-
-        "Be helpful, accurate, natural and concise. " +
-
-        "Do not invent information.",
-
-      maxOutputTokens: 4096
+      systemInstruction: SYSTEM_INSTRUCTION,
+      maxOutputTokens: 8192,
+      tools: [
+        {
+          googleSearch: {}
+        }
+      ]
     }
   });
 
-  const answer = String(response?.text || "").trim();
+  const text = String(response?.text || "").trim();
 
-  if (!answer) {
+  if (!text) {
     throw new Error(
-      `Gemini model ${model} returned an empty response.`
+      `Model ${model} returned an empty response.`
     );
   }
 
-  return answer;
+  return text;
 }
 
-async function askGemini(message) {
+async function askLumora(message, history, image) {
   if (!process.env.GEMINI_API_KEY) {
     throw new Error(
       "GEMINI_API_KEY is not configured on the server."
@@ -154,28 +218,29 @@ async function askGemini(message) {
 
   let lastError = null;
 
-  for (const model of MODELS) {
+  for (const model of CHAT_MODELS) {
     try {
-      console.log(`Trying Gemini model: ${model}`);
+      console.log(`Trying model: ${model}`);
 
-      const reply = await generateWithModel(
+      const reply = await generateChat(
         ai,
         model,
-        message
+        message,
+        history,
+        image
       );
 
-      console.log(`Gemini success: ${model}`);
+      console.log(`Model success: ${model}`);
 
       return {
         reply,
         model
       };
-
     } catch (error) {
       lastError = error;
 
       console.error(
-        `Gemini ${model} failed:`,
+        `${model} failed:`,
         error?.message || error
       );
 
@@ -183,7 +248,7 @@ async function askGemini(message) {
         throw error;
       }
 
-      await new Promise(resolve =>
+      await new Promise((resolve) =>
         setTimeout(resolve, 500)
       );
     }
@@ -197,24 +262,85 @@ async function askGemini(message) {
   );
 }
 
+async function generateImage(prompt, image) {
+  if (!process.env.GEMINI_API_KEY) {
+    throw new Error(
+      "GEMINI_API_KEY is not configured on the server."
+    );
+  }
 
-// ======================================
-// HOME
-// ======================================
+  const ai = new GoogleGenAI({
+    apiKey: process.env.GEMINI_API_KEY
+  });
+
+  const contents = [];
+
+  const sourceImage = parseDataUrl(image);
+
+  if (sourceImage) {
+    contents.push({
+      inlineData: {
+        mimeType: sourceImage.mimeType,
+        data: sourceImage.data
+      }
+    });
+  }
+
+  contents.push({
+    text: String(prompt || "Create an image.")
+  });
+
+  const response = await ai.models.generateContent({
+    model: IMAGE_MODEL,
+    contents,
+    config: {
+      responseModalities: ["TEXT", "IMAGE"]
+    }
+  });
+
+  const parts =
+    response?.candidates?.[0]?.content?.parts || [];
+
+  let imageData = null;
+  let text = "";
+
+  for (const part of parts) {
+    if (part?.inlineData?.data) {
+      imageData = {
+        data: part.inlineData.data,
+        mimeType:
+          part.inlineData.mimeType || "image/png"
+      };
+    }
+
+    if (part?.text) {
+      text += part.text;
+    }
+  }
+
+  if (!imageData) {
+    throw new Error(
+      "The image model did not return an image."
+    );
+  }
+
+  return {
+    image: `data:${imageData.mimeType};base64,${imageData.data}`,
+    text: text.trim()
+  };
+}
 
 app.get("/", (req, res) => {
   res.json({
     name: "Lumora AI Backend",
     status: "online",
     provider: "Google Gemini",
+    multimodal: true,
+    webSearch: true,
+    imageGeneration: true,
     fallback: true
   });
 });
-
-
-// ======================================
-// HEALTH CHECK
-// ======================================
 
 app.get("/health", (req, res) => {
   res.json({
@@ -223,73 +349,88 @@ app.get("/health", (req, res) => {
   });
 });
 
-
-// ======================================
-// CHAT
-// ======================================
-
 app.post("/chat", async (req, res) => {
+  const message = String(
+    req.body?.message || ""
+  ).trim();
+
+  const history = req.body?.history || [];
+  const image = req.body?.image || null;
+
+  if (!message && !image) {
+    return res.status(400).json({
+      error: "Message or image is required."
+    });
+  }
+
+  if (isCreatorQuestion(message)) {
+    return res.json({
+      reply: isMostlyEnglish(message)
+        ? CREATOR_EN
+        : CREATOR_BN,
+      model: "lumora-creator-response"
+    });
+  }
+
   try {
-    const message = String(
-      req.body?.message || ""
-    ).trim();
-
-    if (!message) {
-      return res.status(400).json({
-        error: "Message is required."
-      });
-    }
-
-    if (!process.env.GEMINI_API_KEY) {
-      return res.status(500).json({
-        error:
-          "GEMINI_API_KEY is not configured on the server."
-      });
-    }
-
-    // ==================================
-    // CREATOR QUESTION
-    // ==================================
-
-    if (isCreatorQuestion(message)) {
-      const reply = isEnglish(message)
-        ? CREATOR_REPLY_EN
-        : CREATOR_REPLY_BN;
-
-      return res.json({
-        reply: reply,
-        model: "lumora-creator-response"
-      });
-    }
-
-    // ==================================
-    // NORMAL AI CHAT
-    // ==================================
-
-    const result = await askGemini(message);
+    const result = await askLumora(
+      message,
+      history,
+      image
+    );
 
     return res.json({
       reply: result.reply,
       model: result.model
     });
-
   } catch (error) {
     console.error(
-      "Lumora AI final error:",
+      "Lumora final error:",
       error
     );
 
     return res.status(503).json({
       error:
-        "Gemini is temporarily unavailable. Please try again in a moment."
+        "Lumora AI is temporarily unavailable. Please try again in a moment."
     });
   }
 });
 
+app.post("/generate-image", async (req, res) => {
+  const prompt = String(
+    req.body?.prompt || ""
+  ).trim();
 
-// ======================================
-// START SERVER
-// ======================================
+  const image = req.body?.image || null;
+
+  if (!prompt) {
+    return res.status(400).json({
+      error: "Image prompt is required."
+    });
+  }
+
+  try {
+    const result = await generateImage(
+      prompt,
+      image
+    );
+
+    return res.json({
+      image: result.image,
+      text: result.text
+    });
+  } catch (error) {
+    console.error(
+      "Image generation error:",
+      error
+    );
+
+    return res.status(503).json({
+      error:
+        "Image generation is temporarily unavailable. Please try again."
+    });
+  }
+});
 
 app.listen(PORT, () => {
   console.log(
