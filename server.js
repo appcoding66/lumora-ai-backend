@@ -9,12 +9,7 @@ app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 3000;
 
-// ================================
-// GEMINI SETTINGS
-// ================================
-
-const CHAT_MODEL = "gemini-3.5-flash-lite";
-const IMAGE_MODEL = "gemini-3.1-flash-image";
+const CHAT_MODEL = "gemini-3.8-flash";
 
 const GEMINI_API_URL =
   "https://generativelanguage.googleapis.com/v1beta/interactions";
@@ -29,8 +24,7 @@ app.get("/", (req, res) => {
     name: "Lumora AI Backend",
     status: "online",
     provider: "Google Gemini",
-    chatModel: CHAT_MODEL,
-    imageModel: IMAGE_MODEL
+    model: CHAT_MODEL
   });
 });
 
@@ -50,6 +44,7 @@ function isCreatorQuestion(message) {
     text.includes("who developed you") ||
     text.includes("who is your creator") ||
     text.includes("who is your developer") ||
+
     text.includes("কে তোমাকে তৈরি করেছে") ||
     text.includes("কে আপনাকে তৈরি করেছে") ||
     text.includes("তোমাকে কে বানিয়েছে") ||
@@ -61,7 +56,100 @@ function isCreatorQuestion(message) {
 
 
 // ================================
-// CHAT WITH GEMINI
+// EXTRACT TEXT FROM GEMINI RESPONSE
+// ================================
+
+function extractGeminiText(data) {
+
+  // Normal shortcut
+  if (
+    typeof data?.output_text === "string" &&
+    data.output_text.trim()
+  ) {
+    return data.output_text.trim();
+  }
+
+
+  // Read model output steps
+  if (Array.isArray(data?.steps)) {
+
+    const texts = [];
+
+    for (const step of data.steps) {
+
+      if (step?.type !== "model_output") {
+        continue;
+      }
+
+      if (!Array.isArray(step.content)) {
+        continue;
+      }
+
+      for (const content of step.content) {
+
+        if (
+          content?.type === "text" &&
+          typeof content.text === "string" &&
+          content.text.trim()
+        ) {
+          texts.push(content.text.trim());
+        }
+
+      }
+    }
+
+    if (texts.length > 0) {
+      return texts.join("\n\n").trim();
+    }
+  }
+
+
+  // Extra fallback
+  if (Array.isArray(data?.output)) {
+
+    const texts = [];
+
+    for (const item of data.output) {
+
+      if (
+        item?.type === "text" &&
+        typeof item.text === "string"
+      ) {
+        texts.push(item.text.trim());
+      }
+
+      if (Array.isArray(item?.content)) {
+
+        for (const content of item.content) {
+
+          if (
+            content?.type === "text" &&
+            typeof content.text === "string"
+          ) {
+            texts.push(content.text.trim());
+          }
+
+        }
+      }
+    }
+
+    const result = texts
+      .filter(Boolean)
+      .join("\n\n")
+      .trim();
+
+    if (result) {
+      return result;
+    }
+  }
+
+
+  return "";
+}
+
+
+// ================================
+// ASK GEMINI
 // ================================
 
 async function askGemini(message) {
@@ -109,7 +197,18 @@ async function askGemini(message) {
   const data = await response.json();
 
 
+  console.log(
+    "Gemini HTTP status:",
+    response.status
+  );
+
+
   if (!response.ok) {
+
+    console.error(
+      "Gemini API error:",
+      JSON.stringify(data, null, 2)
+    );
 
     const error = new Error(
       data?.error?.message ||
@@ -122,22 +221,25 @@ async function askGemini(message) {
   }
 
 
-  const answer =
-    data?.output_text;
+  // Debug response structure
+  console.log(
+    "Gemini response:",
+    JSON.stringify(data, null, 2)
+  );
 
 
-  if (
-    typeof answer !== "string" ||
-    !answer.trim()
-  ) {
+  const answer = extractGeminiText(data);
+
+
+  if (!answer) {
 
     throw new Error(
-      "Gemini returned an empty response."
+      "Gemini returned no readable text. Check Render logs for the full Gemini response."
     );
   }
 
 
-  return answer.trim();
+  return answer;
 }
 
 
@@ -223,158 +325,6 @@ app.post("/chat", async (req, res) => {
   }
 
 });
-
-
-// ================================
-// IMAGE GENERATION
-// ================================
-
-app.post(
-  "/generate-image",
-  async (req, res) => {
-
-    const prompt =
-      String(req.body?.prompt || "").trim();
-
-
-    if (!prompt) {
-
-      return res.status(400).json({
-        error: "Image prompt is required."
-      });
-
-    }
-
-
-    if (!process.env.GEMINI_API_KEY) {
-
-      return res.status(500).json({
-        error:
-          "GEMINI_API_KEY is not configured on the server."
-      });
-
-    }
-
-
-    try {
-
-      const requestBody = {
-
-        model: IMAGE_MODEL,
-
-        input: prompt,
-
-        response_format: {
-
-          type: "image",
-
-          mime_type: "image/png",
-
-          aspect_ratio: "1:1",
-
-          image_size: "1K"
-
-        },
-
-        store: false
-
-      };
-
-
-      const response =
-        await fetch(
-          GEMINI_API_URL,
-          {
-            method: "POST",
-
-            headers: {
-
-              "Content-Type":
-                "application/json",
-
-              "x-goog-api-key":
-                process.env.GEMINI_API_KEY
-
-            },
-
-            body:
-              JSON.stringify(requestBody)
-
-          }
-        );
-
-
-      const data =
-        await response.json();
-
-
-      if (!response.ok) {
-
-        const error = new Error(
-          data?.error?.message ||
-          `Image API error: ${response.status}`
-        );
-
-        error.status =
-          response.status;
-
-        throw error;
-
-      }
-
-
-      const image =
-        data?.output_image;
-
-
-      if (!image?.data) {
-
-        throw new Error(
-          "The image model returned no image."
-        );
-
-      }
-
-
-      const mime =
-        image.mime_type ||
-        "image/png";
-
-
-      return res.json({
-
-        image:
-          `data:${mime};base64,${image.data}`,
-
-        model: IMAGE_MODEL
-
-      });
-
-    }
-
-
-    catch (error) {
-
-      console.error(
-        "Image generation error:",
-        error
-      );
-
-
-      return res.status(
-        error.status || 500
-      ).json({
-
-        error:
-          error.message ||
-          "Unable to generate image."
-
-      });
-
-    }
-
-  }
-);
 
 
 // ================================
