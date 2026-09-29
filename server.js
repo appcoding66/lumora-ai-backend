@@ -1,185 +1,242 @@
-const express = require("express");
-const cors = require("cors");
-require("dotenv").config();
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import { GoogleGenAI } from "@google/genai";
+
+dotenv.config();
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-const PORT = process.env.PORT || 3000;
-const DEFAULT_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
+// Gemini model fallback
+// একটি model ব্যস্ত থাকলে পরের model চেষ্টা করবে।
+const MODELS = [
+  "gemini-3.5-flash-lite",
+  "gemini-3.8-flash",
+  "gemini-3.7-flash",
+  "gemini-3.6-flash"
+];
+
+const CREATOR_REPLY =
+  "আমি Lumora AI। আমাকে তৈরি ও ডেভেলপ করেছেন অঙ্কুশ মণ্ডল (Ankush Mondal)। আমার AI প্রযুক্তি Google Gemini দ্বারা চালিত।";
+
+function isCreatorQuestion(message) {
+  const text = message.toLowerCase();
+
+  return (
+    text.includes("who created you") ||
+    text.includes("who made you") ||
+    text.includes("who built you") ||
+    text.includes("who developed you") ||
+    text.includes("who is your creator") ||
+    text.includes("who is your developer") ||
+    text.includes("কে তোমাকে তৈরি করেছে") ||
+    text.includes("কে আপনাকে তৈরি করেছে") ||
+    text.includes("তোমাকে কে বানিয়েছে") ||
+    text.includes("আপনাকে কে বানিয়েছে") ||
+    text.includes("কে তোমাকে বানিয়েছে") ||
+    text.includes("কে আপনাকে বানিয়েছে")
+  );
+}
+
+function shouldFallback(error) {
+  const text = [
+    error?.message,
+    error?.status,
+    error?.code,
+    error?.response?.status
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toUpperCase();
+
+  return (
+    /\b(429|500|502|503|504)\b/.test(text) ||
+    text.includes("UNAVAILABLE") ||
+    text.includes("RESOURCE_EXHAUSTED") ||
+    text.includes("HIGH DEMAND") ||
+    text.includes("OVERLOADED") ||
+    text.includes("RATE LIMIT")
+  );
+}
+
+async function generateWithModel(ai, model, message) {
+  const response = await ai.models.generateContent({
+    model: model,
+    contents: message,
+
+    config: {
+      systemInstruction:
+        "You are Lumora AI, a helpful AI assistant. " +
+        "Lumora AI was created and developed by Ankush Mondal (অঙ্কুশ মণ্ডল). " +
+        "Ankush Mondal created the Lumora AI app and assistant, " +
+        "but he did not create Google Gemini itself. " +
+        "Always answer in the same language used by the user. " +
+        "If the user speaks Bengali, answer naturally in Bengali. " +
+        "Be helpful, accurate and clear. " +
+        "Do not invent information.",
+
+      maxOutputTokens: 4096
+    }
+  });
+
+  const answer = String(response?.text || "").trim();
+
+  if (!answer) {
+    throw new Error(
+      `Gemini model ${model} returned an empty response.`
+    );
+  }
+
+  return answer;
+}
+
+async function askGemini(message) {
+  if (!process.env.GEMINI_API_KEY) {
+    throw new Error(
+      "GEMINI_API_KEY is not configured on the server."
+    );
+  }
+
+  const ai = new GoogleGenAI({
+    apiKey: process.env.GEMINI_API_KEY
+  });
+
+  let lastError = null;
+
+  for (const model of MODELS) {
+    try {
+      console.log(`Trying Gemini model: ${model}`);
+
+      const reply = await generateWithModel(
+        ai,
+        model,
+        message
+      );
+
+      console.log(`Gemini success: ${model}`);
+
+      return {
+        reply,
+        model
+      };
+
+    } catch (error) {
+      lastError = error;
+
+      console.error(
+        `Gemini ${model} failed:`,
+        error?.message || error
+      );
+
+      if (!shouldFallback(error)) {
+        throw error;
+      }
+
+      // পরের model চেষ্টা করার আগে ছোট delay
+      await new Promise(resolve =>
+        setTimeout(resolve, 500)
+      );
+    }
+  }
+
+  throw (
+    lastError ||
+    new Error(
+      "All Gemini models are temporarily unavailable."
+    )
+  );
+}
+
+
+// ===============================
+// HOME / STATUS
+// ===============================
 
 app.get("/", (req, res) => {
   res.json({
     name: "Lumora AI Backend",
     status: "online",
     provider: "Google Gemini",
-    model: DEFAULT_MODEL
+    fallback: true,
+    models: MODELS
   });
 });
 
-function cleanHistory(history) {
-  if (!Array.isArray(history)) return [];
 
-  return history
-    .filter(item =>
-      item &&
-      (item.role === "user" || item.role === "model") &&
-      typeof item.text === "string" &&
-      item.text.trim()
-    )
-    .slice(-20)
-    .map(item => ({
-      role: item.role,
-      parts: [{ text: item.text.trim() }]
-    }));
-}
+// ===============================
+// HEALTH CHECK
+// ===============================
 
-function extractReply(data) {
-  const parts =
-    data?.candidates?.[0]?.content?.parts;
-
-  if (!Array.isArray(parts)) return "";
-
-  return parts
-    .filter(part => typeof part?.text === "string")
-    .map(part => part.text)
-    .join("")
-    .trim();
-}
-
-async function callGemini(model, contents, useSearch) {
-  const url =
-    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
-
-  const body = {
-    systemInstruction: {
-      parts: [{
-        text:
-          "You are Lumora AI, a helpful general-purpose AI assistant. " +
-          "Answer accurately and clearly. Use the same language as the user. " +
-          "For Bengali questions, answer in natural Bengali. " +
-          "Do not invent facts. If you are unsure, say so. " +
-          "For current or changing information, use Google Search when available. " +
-          "Give practical explanations and examples when useful."
-      }]
-    },
-    contents,
-    generationConfig: {
-      temperature: 0.7,
-      maxOutputTokens: 4096
-    }
-  };
-
-  // Google Search grounding is supported by Gemini 2.5 Flash-Lite
-  // and can provide up-to-date information while staying within
-  // the model's available free-tier search allowance.
-  if (useSearch) {
-    body.tools = [{ google_search: {} }];
-  }
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": process.env.GEMINI_API_KEY
-    },
-    body: JSON.stringify(body)
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    status: "online"
   });
+});
 
-  const data = await response.json();
 
-  if (!response.ok) {
-    const message =
-      data?.error?.message ||
-      `Gemini API request failed with status ${response.status}.`;
-
-    const error = new Error(message);
-    error.status = response.status;
-    error.data = data;
-    throw error;
-  }
-
-  return extractReply(data);
-}
+// ===============================
+// CHAT API
+// ===============================
 
 app.post("/chat", async (req, res) => {
-  const message = String(req.body?.message || "").trim();
-
-  if (!message) {
-    return res.status(400).json({ error: "Message is required." });
-  }
-
-  const apiKey = process.env.GEMINI_API_KEY;
-
-  if (!apiKey) {
-    return res.status(500).json({
-      error: "GEMINI_API_KEY is not configured on the server."
-    });
-  }
-
-  const history = cleanHistory(req.body?.history);
-
-  // If the frontend sends history, keep the conversation context.
-  // Remove a possible duplicate current message from the end.
-  const contents = [...history];
-
-  if (
-    contents.length === 0 ||
-    contents[contents.length - 1]?.role !== "user" ||
-    contents[contents.length - 1]?.parts?.[0]?.text !== message
-  ) {
-    contents.push({
-      role: "user",
-      parts: [{ text: message }]
-    });
-  }
-
   try {
-    let reply = "";
+    const message = String(
+      req.body?.message || ""
+    ).trim();
 
-    try {
-      // First attempt: free-tier friendly model with Google Search grounding.
-      reply = await callGemini(DEFAULT_MODEL, contents, true);
-    } catch (firstError) {
-      console.error("Gemini first attempt failed:", firstError.message);
-
-      // Some accounts/projects may not have the 2.5 model available.
-      // Try a current Flash-Lite model without Search as a fallback.
-      const fallbackModel = "gemini-3.5-flash-lite";
-
-      if (
-        DEFAULT_MODEL !== fallbackModel &&
-        (firstError.status === 400 ||
-          firstError.status === 403 ||
-          firstError.status === 404)
-      ) {
-        reply = await callGemini(fallbackModel, contents, false);
-      } else {
-        throw firstError;
-      }
-    }
-
-    if (!reply) {
-      return res.status(502).json({
-        error: "Gemini returned no text response."
+    if (!message) {
+      return res.status(400).json({
+        error: "Message is required."
       });
     }
 
-    res.json({
-      reply,
-      model: DEFAULT_MODEL
-    });
-  } catch (err) {
-    console.error("Lumora Gemini error:", err);
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(500).json({
+        error:
+          "GEMINI_API_KEY is not configured on the server."
+      });
+    }
 
-    res.status(err.status && Number.isInteger(err.status) ? err.status : 500).json({
-      error: err.message || "Unable to get a response from Gemini."
+    // Creator question হলে সরাসরি Lumora-এর উত্তর
+    if (isCreatorQuestion(message)) {
+      return res.json({
+        reply: CREATOR_REPLY,
+        model: "lumora-creator-response"
+      });
+    }
+
+    const result = await askGemini(message);
+
+    return res.json({
+      reply: result.reply,
+      model: result.model
+    });
+
+  } catch (error) {
+    console.error(
+      "Lumora AI final error:",
+      error
+    );
+
+    return res.status(503).json({
+      error:
+        "Gemini is temporarily unavailable. Please try again in a moment."
     });
   }
 });
 
+
+// ===============================
+// START SERVER
+// ===============================
+
 app.listen(PORT, () => {
-  console.log(`Lumora AI Gemini Backend running on port ${PORT}`);
+  console.log(
+    `Lumora AI Backend running on port ${PORT}`
+  );
 });
